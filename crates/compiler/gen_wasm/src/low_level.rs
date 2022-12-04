@@ -1716,7 +1716,7 @@ impl<'a> LowLevelCall<'a> {
                             .load_symbols(&mut backend.code_builder, &[num, bits]);
                         backend.code_builder.i64_shr_u();
                     }
-                    I128 => todo!("{:?} for I128", self.lowlevel),
+                    I128 => self.load_args_and_call_zig(backend, "__lshrti3"), // from compiler_rt
                     _ => panic_ret_type(),
                 }
             }
