@@ -119,6 +119,9 @@ flags! {
 
     // ===Mono===
 
+    /// Type-checks the mono IR after specialization.
+    ROC_CHECK_MONO_IR
+
     /// Writes a pretty-printed mono IR to stderr after function specialization.
     ROC_PRINT_IR_AFTER_SPECIALIZATION
 
@@ -149,6 +152,9 @@ flags! {
 
     /// Writes a `final.wasm` file to /tmp
     ROC_WRITE_FINAL_WASM
+
+    /// Prints Wasm interpreter debug log in test_gen
+    ROC_LOG_WASM_INTERP
 
     // ===Load===
 

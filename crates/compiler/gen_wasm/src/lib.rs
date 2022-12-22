@@ -143,7 +143,7 @@ pub fn build_app_module<'a>(
     if DEBUG_SETTINGS.user_procs_ir {
         println!("## procs");
         for proc in procs.iter() {
-            println!("{}", proc.to_pretty(env.layout_interner, 200));
+            println!("{}", proc.to_pretty(env.layout_interner, 200, true));
             // println!("{:?}", proc);
         }
     }
@@ -161,7 +161,7 @@ pub fn build_app_module<'a>(
     if DEBUG_SETTINGS.helper_procs_ir {
         println!("## helper_procs");
         for proc in helper_procs.iter() {
-            println!("{}", proc.to_pretty(env.layout_interner, 200));
+            println!("{}", proc.to_pretty(env.layout_interner, 200, true));
             // println!("{:#?}", proc);
         }
     }
@@ -251,7 +251,7 @@ pub const DEBUG_SETTINGS: WasmDebugSettings = WasmDebugSettings {
     let_stmt_ir: false && cfg!(debug_assertions),
     instructions: false && cfg!(debug_assertions),
     storage_map: false && cfg!(debug_assertions),
-    keep_test_binary: false && cfg!(debug_assertions),
+    keep_test_binary: false && cfg!(debug_assertions), // see also ROC_WRITE_FINAL_WASM
 };
 
 #[cfg(test)]

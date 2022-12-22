@@ -73,7 +73,6 @@ pub enum DecWidth {
 pub enum FloatWidth {
     F32,
     F64,
-    F128,
 }
 
 impl FloatWidth {
@@ -86,7 +85,6 @@ impl FloatWidth {
         match self {
             F32 => 4,
             F64 => 8,
-            F128 => 16,
         }
     }
 
@@ -99,7 +97,7 @@ impl FloatWidth {
         // the compiler is targeting (e.g. what the Roc code will be compiled to).
         match self {
             F32 => 4,
-            F64 | F128 => match target_info.architecture {
+            F64 => match target_info.architecture {
                 X86_64 | Aarch64 | Wasm32 => 8,
                 X86_32 | Aarch32 => 4,
             },
@@ -225,7 +223,6 @@ impl Index<FloatWidth> for IntrinsicName {
         match index {
             FloatWidth::F32 => self.options[1],
             FloatWidth::F64 => self.options[2],
-            FloatWidth::F128 => self.options[3],
         }
     }
 }
@@ -256,7 +253,6 @@ macro_rules! float_intrinsic {
 
         output.options[1] = concat!($name, ".f32");
         output.options[2] = concat!($name, ".f64");
-        output.options[3] = concat!($name, ".f128");
 
         output
     }};
@@ -424,9 +420,9 @@ pub const UTILS_EXPECT_FAILED_START_SHARED_BUFFER: &str =
     "roc_builtins.utils.expect_failed_start_shared_buffer";
 pub const UTILS_EXPECT_FAILED_START_SHARED_FILE: &str =
     "roc_builtins.utils.expect_failed_start_shared_file";
-pub const UTILS_EXPECT_FAILED_FINALIZE: &str = "roc_builtins.utils.expect_failed_finalize";
 pub const UTILS_EXPECT_READ_ENV_SHARED_BUFFER: &str = "roc_builtins.utils.read_env_shared_buffer";
-pub const UTILS_SEND_DBG: &str = "roc_builtins.utils.send_dbg";
+pub const NOTIFY_PARENT_EXPECT: &str = "roc_builtins.utils.notify_parent_expect";
+pub const NOTIFY_PARENT_DBG: &str = "roc_builtins.utils.notify_parent_dbg";
 
 pub const UTILS_LONGJMP: &str = "longjmp";
 pub const UTILS_SETJMP: &str = "setjmp";

@@ -27,14 +27,14 @@ use roc_late_solve::storage::{ExternalModuleStorage, ExternalModuleStorageSnapsh
 use roc_late_solve::{resolve_ability_specialization, AbilitiesView, Resolved, UnificationFailed};
 use roc_module::ident::{ForeignSymbol, Lowercase, TagName};
 use roc_module::low_level::LowLevel;
-use roc_module::symbol::{IdentIds, ModuleId, Symbol};
+use roc_module::symbol::{IdentId, IdentIds, ModuleId, Symbol};
 use roc_problem::can::{RuntimeError, ShadowKind};
 use roc_region::all::{Loc, Region};
 use roc_std::RocDec;
 use roc_target::TargetInfo;
 use roc_types::subs::{
-    instantiate_rigids, Content, ExhaustiveMark, FlatType, RedundantMark, StorageSubs, Subs,
-    Variable, VariableSubsSlice,
+    instantiate_rigids, storage_copy_var_to, Content, ExhaustiveMark, FlatType, RedundantMark,
+    StorageSubs, Subs, Variable, VariableSubsSlice,
 };
 use std::collections::HashMap;
 use ven_pretty::{BoxAllocator, DocAllocator, DocBuilder};
@@ -119,9 +119,15 @@ pub enum OptLevel {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct EntryPoint<'a> {
+pub struct SingleEntryPoint<'a> {
     pub symbol: Symbol,
     pub layout: ProcLayout<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum EntryPoint<'a> {
+    Single(SingleEntryPoint<'a>),
+    Expects { symbols: &'a [Symbol] },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -326,6 +332,7 @@ impl<'a> Proc<'a> {
         &'b self,
         alloc: &'b D,
         interner: &'b I,
+        pretty: bool,
         _parens: Parens,
     ) -> DocBuilder<'b, D, A>
     where
@@ -335,7 +342,7 @@ impl<'a> Proc<'a> {
         I: Interner<'a, Layout<'a>>,
     {
         let args_doc = self.args.iter().map(|(layout, symbol)| {
-            let arg_doc = symbol_to_doc(alloc, *symbol);
+            let arg_doc = symbol_to_doc(alloc, *symbol, pretty);
             if pretty_print_ir_symbols() {
                 arg_doc.append(alloc.reflow(": ")).append(layout.to_doc(
                     alloc,
@@ -350,36 +357,36 @@ impl<'a> Proc<'a> {
         if pretty_print_ir_symbols() {
             alloc
                 .text("procedure : ")
-                .append(symbol_to_doc(alloc, self.name.name()))
+                .append(symbol_to_doc(alloc, self.name.name(), pretty))
                 .append(" ")
                 .append(self.ret_layout.to_doc(alloc, interner, Parens::NotNeeded))
                 .append(alloc.hardline())
                 .append(alloc.text("procedure = "))
-                .append(symbol_to_doc(alloc, self.name.name()))
+                .append(symbol_to_doc(alloc, self.name.name(), pretty))
                 .append(" (")
                 .append(alloc.intersperse(args_doc, ", "))
                 .append("):")
                 .append(alloc.hardline())
-                .append(self.body.to_doc(alloc, interner).indent(4))
+                .append(self.body.to_doc(alloc, interner, pretty).indent(4))
         } else {
             alloc
                 .text("procedure ")
-                .append(symbol_to_doc(alloc, self.name.name()))
+                .append(symbol_to_doc(alloc, self.name.name(), pretty))
                 .append(" (")
                 .append(alloc.intersperse(args_doc, ", "))
                 .append("):")
                 .append(alloc.hardline())
-                .append(self.body.to_doc(alloc, interner).indent(4))
+                .append(self.body.to_doc(alloc, interner, pretty).indent(4))
         }
     }
 
-    pub fn to_pretty<I>(&self, interner: &I, width: usize) -> String
+    pub fn to_pretty<I>(&self, interner: &I, width: usize, pretty: bool) -> String
     where
         I: Interner<'a, Layout<'a>>,
     {
         let allocator = BoxAllocator;
         let mut w = std::vec::Vec::new();
-        self.to_doc::<_, (), _>(&allocator, interner, Parens::NotNeeded)
+        self.to_doc::<_, (), _>(&allocator, interner, pretty, Parens::NotNeeded)
             .1
             .render(width, &mut w)
             .unwrap();
@@ -1458,6 +1465,9 @@ impl<'a> Specializations<'a> {
 pub struct Env<'a, 'i> {
     pub arena: &'a Bump,
     pub subs: &'i mut Subs,
+    /// [Subs] to write specialized variables of lookups in expects.
+    /// [None] if this module doesn't produce any expects.
+    pub expectation_subs: Option<&'i mut Subs>,
     pub home: ModuleId,
     pub ident_ids: &'i mut IdentIds,
     pub target_info: TargetInfo,
@@ -1594,6 +1604,9 @@ pub fn cond<'a>(
 
 pub type Stores<'a> = &'a [(Symbol, Layout<'a>, Expr<'a>)];
 
+/// The specialized type of a lookup. Represented as a type-variable.
+pub type LookupType = Variable;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt<'a> {
     Let(Symbol, Expr<'a>, Layout<'a>, &'a Stmt<'a>),
@@ -1615,7 +1628,7 @@ pub enum Stmt<'a> {
         condition: Symbol,
         region: Region,
         lookups: &'a [Symbol],
-        layouts: &'a [Layout<'a>],
+        variables: &'a [LookupType],
         /// what happens after the expect
         remainder: &'a Stmt<'a>,
     },
@@ -1623,7 +1636,7 @@ pub enum Stmt<'a> {
         condition: Symbol,
         region: Region,
         lookups: &'a [Symbol],
-        layouts: &'a [Layout<'a>],
+        variables: &'a [LookupType],
         /// what happens after the expect
         remainder: &'a Stmt<'a>,
     },
@@ -1675,35 +1688,13 @@ pub enum BranchInfo<'a> {
 }
 
 impl<'a> BranchInfo<'a> {
-    pub fn to_doc<'b, D, A>(&'b self, alloc: &'b D) -> DocBuilder<'b, D, A>
+    pub fn to_doc<'b, D, A>(&'b self, alloc: &'b D, _pretty: bool) -> DocBuilder<'b, D, A>
     where
         D: DocAllocator<'b, A>,
         D::Doc: Clone,
         A: Clone,
     {
-        use BranchInfo::*;
-
-        match self {
-            Constructor {
-                tag_id,
-                scrutinee,
-                layout: _,
-            } if pretty_print_ir_symbols() => alloc
-                .hardline()
-                .append("    BranchInfo: { scrutinee: ")
-                .append(symbol_to_doc(alloc, *scrutinee))
-                .append(", tag_id: ")
-                .append(format!("{}", tag_id))
-                .append("} "),
-
-            _ => {
-                if pretty_print_ir_symbols() {
-                    alloc.text(" <no branch info>")
-                } else {
-                    alloc.text("")
-                }
-            }
-        }
+        alloc.text("")
     }
 }
 
@@ -1724,7 +1715,7 @@ pub enum ModifyRc {
 }
 
 impl ModifyRc {
-    pub fn to_doc<'a, D, A>(self, alloc: &'a D) -> DocBuilder<'a, D, A>
+    pub fn to_doc<'a, D, A>(self, alloc: &'a D, pretty: bool) -> DocBuilder<'a, D, A>
     where
         D: DocAllocator<'a, A>,
         D::Doc: Clone,
@@ -1735,20 +1726,20 @@ impl ModifyRc {
         match self {
             Inc(symbol, 1) => alloc
                 .text("inc ")
-                .append(symbol_to_doc(alloc, symbol))
+                .append(symbol_to_doc(alloc, symbol, pretty))
                 .append(";"),
             Inc(symbol, n) => alloc
                 .text("inc ")
                 .append(alloc.text(format!("{} ", n)))
-                .append(symbol_to_doc(alloc, symbol))
+                .append(symbol_to_doc(alloc, symbol, pretty))
                 .append(";"),
             Dec(symbol) => alloc
                 .text("dec ")
-                .append(symbol_to_doc(alloc, symbol))
+                .append(symbol_to_doc(alloc, symbol, pretty))
                 .append(";"),
             DecRef(symbol) => alloc
                 .text("decref ")
-                .append(symbol_to_doc(alloc, symbol))
+                .append(symbol_to_doc(alloc, symbol, pretty))
                 .append(";"),
         }
     }
@@ -1808,7 +1799,7 @@ pub struct Call<'a> {
 }
 
 impl<'a> Call<'a> {
-    pub fn to_doc<'b, D, A>(&'b self, alloc: &'b D) -> DocBuilder<'b, D, A>
+    pub fn to_doc<'b, D, A>(&'b self, alloc: &'b D, pretty: bool) -> DocBuilder<'b, D, A>
     where
         D: DocAllocator<'b, A>,
         D::Doc: Clone,
@@ -1822,19 +1813,19 @@ impl<'a> Call<'a> {
             CallType::ByName { name, .. } => {
                 let it = std::iter::once(name.name())
                     .chain(arguments.iter().copied())
-                    .map(|s| symbol_to_doc(alloc, s));
+                    .map(|s| symbol_to_doc(alloc, s, pretty));
 
                 alloc.text("CallByName ").append(alloc.intersperse(it, " "))
             }
             LowLevel { op: lowlevel, .. } => {
-                let it = arguments.iter().map(|s| symbol_to_doc(alloc, *s));
+                let it = arguments.iter().map(|s| symbol_to_doc(alloc, *s, pretty));
 
                 alloc
                     .text(format!("lowlevel {:?} ", lowlevel))
                     .append(alloc.intersperse(it, " "))
             }
             HigherOrder(higher_order) => {
-                let it = arguments.iter().map(|s| symbol_to_doc(alloc, *s));
+                let it = arguments.iter().map(|s| symbol_to_doc(alloc, *s, pretty));
 
                 alloc
                     .text(format!("lowlevel {:?} ", higher_order.op))
@@ -1843,7 +1834,7 @@ impl<'a> Call<'a> {
             Foreign {
                 ref foreign_symbol, ..
             } => {
-                let it = arguments.iter().map(|s| symbol_to_doc(alloc, *s));
+                let it = arguments.iter().map(|s| symbol_to_doc(alloc, *s, pretty));
 
                 alloc
                     .text(format!("foreign {:?} ", foreign_symbol.as_str()))
@@ -2034,10 +2025,10 @@ impl<'a> Literal<'a> {
     }
 }
 
-pub(crate) fn symbol_to_doc_string(symbol: Symbol) -> String {
+pub(crate) fn symbol_to_doc_string(symbol: Symbol, force_pretty: bool) -> String {
     use roc_module::ident::ModuleName;
 
-    if pretty_print_ir_symbols() {
+    if pretty_print_ir_symbols() || force_pretty {
         format!("{:?}", symbol)
     } else {
         let text = format!("{}", symbol);
@@ -2051,26 +2042,30 @@ pub(crate) fn symbol_to_doc_string(symbol: Symbol) -> String {
     }
 }
 
-fn symbol_to_doc<'b, D, A>(alloc: &'b D, symbol: Symbol) -> DocBuilder<'b, D, A>
+fn symbol_to_doc<'b, D, A>(alloc: &'b D, symbol: Symbol, force_pretty: bool) -> DocBuilder<'b, D, A>
 where
     D: DocAllocator<'b, A>,
     D::Doc: Clone,
     A: Clone,
 {
-    alloc.text(symbol_to_doc_string(symbol))
+    alloc.text(symbol_to_doc_string(symbol, force_pretty))
 }
 
-fn join_point_to_doc<'b, D, A>(alloc: &'b D, symbol: JoinPointId) -> DocBuilder<'b, D, A>
+fn join_point_to_doc<'b, D, A>(
+    alloc: &'b D,
+    symbol: JoinPointId,
+    pretty: bool,
+) -> DocBuilder<'b, D, A>
 where
     D: DocAllocator<'b, A>,
     D::Doc: Clone,
     A: Clone,
 {
-    symbol_to_doc(alloc, symbol.0)
+    symbol_to_doc(alloc, symbol.0, pretty)
 }
 
 impl<'a> Expr<'a> {
-    pub fn to_doc<'b, D, A>(&'b self, alloc: &'b D) -> DocBuilder<'b, D, A>
+    pub fn to_doc<'b, D, A>(&'b self, alloc: &'b D, pretty: bool) -> DocBuilder<'b, D, A>
     where
         D: DocAllocator<'b, A>,
         D::Doc: Clone,
@@ -2081,7 +2076,7 @@ impl<'a> Expr<'a> {
         match self {
             Literal(lit) => lit.to_doc(alloc),
 
-            Call(call) => call.to_doc(alloc),
+            Call(call) => call.to_doc(alloc, pretty),
 
             Tag {
                 tag_id, arguments, ..
@@ -2091,7 +2086,7 @@ impl<'a> Expr<'a> {
                     .append(alloc.text(tag_id.to_string()))
                     .append(")");
 
-                let it = arguments.iter().map(|s| symbol_to_doc(alloc, *s));
+                let it = arguments.iter().map(|s| symbol_to_doc(alloc, *s, pretty));
 
                 doc_tag
                     .append(alloc.space())
@@ -2109,11 +2104,11 @@ impl<'a> Expr<'a> {
                     .append(alloc.text(tag_id.to_string()))
                     .append(")");
 
-                let it = arguments.iter().map(|s| symbol_to_doc(alloc, *s));
+                let it = arguments.iter().map(|s| symbol_to_doc(alloc, *s, pretty));
 
                 alloc
                     .text("Reuse ")
-                    .append(symbol_to_doc(alloc, *symbol))
+                    .append(symbol_to_doc(alloc, *symbol, pretty))
                     .append(alloc.space())
                     .append(format!("{:?}", update_mode))
                     .append(alloc.space())
@@ -2130,7 +2125,7 @@ impl<'a> Expr<'a> {
             )),
 
             Struct(args) => {
-                let it = args.iter().map(|s| symbol_to_doc(alloc, *s));
+                let it = args.iter().map(|s| symbol_to_doc(alloc, *s, pretty));
 
                 alloc
                     .text("Struct {")
@@ -2140,7 +2135,7 @@ impl<'a> Expr<'a> {
             Array { elems, .. } => {
                 let it = elems.iter().map(|e| match e {
                     ListLiteralElement::Literal(l) => l.to_doc(alloc),
-                    ListLiteralElement::Symbol(s) => symbol_to_doc(alloc, *s),
+                    ListLiteralElement::Symbol(s) => symbol_to_doc(alloc, *s, pretty),
                 });
 
                 alloc
@@ -2154,17 +2149,21 @@ impl<'a> Expr<'a> {
                 index, structure, ..
             } => alloc
                 .text(format!("StructAtIndex {} ", index))
-                .append(symbol_to_doc(alloc, *structure)),
+                .append(symbol_to_doc(alloc, *structure, pretty)),
 
             RuntimeErrorFunction(s) => alloc.text(format!("ErrorFunction {}", s)),
 
             GetTagId { structure, .. } => alloc
                 .text("GetTagId ")
-                .append(symbol_to_doc(alloc, *structure)),
+                .append(symbol_to_doc(alloc, *structure, pretty)),
 
-            ExprBox { symbol, .. } => alloc.text("Box ").append(symbol_to_doc(alloc, *symbol)),
+            ExprBox { symbol, .. } => alloc
+                .text("Box ")
+                .append(symbol_to_doc(alloc, *symbol, pretty)),
 
-            ExprUnbox { symbol, .. } => alloc.text("Unbox ").append(symbol_to_doc(alloc, *symbol)),
+            ExprUnbox { symbol, .. } => alloc
+                .text("Unbox ")
+                .append(symbol_to_doc(alloc, *symbol, pretty)),
 
             UnionAtIndex {
                 tag_id,
@@ -2173,14 +2172,14 @@ impl<'a> Expr<'a> {
                 ..
             } => alloc
                 .text(format!("UnionAtIndex (Id {}) (Index {}) ", tag_id, index))
-                .append(symbol_to_doc(alloc, *structure)),
+                .append(symbol_to_doc(alloc, *structure, pretty)),
         }
     }
 
-    pub fn to_pretty(&self, width: usize) -> String {
+    pub fn to_pretty(&self, width: usize, pretty: bool) -> String {
         let allocator = BoxAllocator;
         let mut w = std::vec::Vec::new();
-        self.to_doc::<_, ()>(&allocator)
+        self.to_doc::<_, ()>(&allocator, pretty)
             .1
             .render(width, &mut w)
             .unwrap();
@@ -2200,7 +2199,12 @@ impl<'a> Stmt<'a> {
         from_can(env, var, can_expr, procs, layout_cache)
     }
 
-    pub fn to_doc<'b, D, A, I>(&'b self, alloc: &'b D, interner: &I) -> DocBuilder<'b, D, A>
+    pub fn to_doc<'b, D, A, I>(
+        &'b self,
+        alloc: &'b D,
+        interner: &I,
+        pretty: bool,
+    ) -> DocBuilder<'b, D, A>
     where
         D: DocAllocator<'b, A>,
         D::Doc: Clone,
@@ -2212,19 +2216,19 @@ impl<'a> Stmt<'a> {
         match self {
             Let(symbol, expr, layout, cont) => alloc
                 .text("let ")
-                .append(symbol_to_doc(alloc, *symbol))
+                .append(symbol_to_doc(alloc, *symbol, pretty))
                 .append(" : ")
                 .append(layout.to_doc(alloc, interner, Parens::NotNeeded))
                 .append(" = ")
-                .append(expr.to_doc(alloc))
+                .append(expr.to_doc(alloc, pretty))
                 .append(";")
                 .append(alloc.hardline())
-                .append(cont.to_doc(alloc, interner)),
+                .append(cont.to_doc(alloc, interner, pretty)),
 
             Refcounting(modify, cont) => modify
-                .to_doc(alloc)
+                .to_doc(alloc, pretty)
                 .append(alloc.hardline())
-                .append(cont.to_doc(alloc, interner)),
+                .append(cont.to_doc(alloc, interner, pretty)),
 
             Expect {
                 condition,
@@ -2232,10 +2236,10 @@ impl<'a> Stmt<'a> {
                 ..
             } => alloc
                 .text("expect ")
-                .append(symbol_to_doc(alloc, *condition))
+                .append(symbol_to_doc(alloc, *condition, pretty))
                 .append(";")
                 .append(alloc.hardline())
-                .append(remainder.to_doc(alloc, interner)),
+                .append(remainder.to_doc(alloc, interner, pretty)),
 
             ExpectFx {
                 condition,
@@ -2243,14 +2247,14 @@ impl<'a> Stmt<'a> {
                 ..
             } => alloc
                 .text("expect-fx ")
-                .append(symbol_to_doc(alloc, *condition))
+                .append(symbol_to_doc(alloc, *condition, pretty))
                 .append(";")
                 .append(alloc.hardline())
-                .append(remainder.to_doc(alloc, interner)),
+                .append(remainder.to_doc(alloc, interner, pretty)),
 
             Ret(symbol) => alloc
                 .text("ret ")
-                .append(symbol_to_doc(alloc, *symbol))
+                .append(symbol_to_doc(alloc, *symbol, pretty))
                 .append(";"),
 
             Switch {
@@ -2264,23 +2268,23 @@ impl<'a> Stmt<'a> {
                         let fail = default_branch.1;
                         alloc
                             .text("if ")
-                            .append(symbol_to_doc(alloc, *cond_symbol))
+                            .append(symbol_to_doc(alloc, *cond_symbol, pretty))
                             .append(" then")
-                            .append(info.to_doc(alloc))
+                            .append(info.to_doc(alloc, pretty))
                             .append(alloc.hardline())
-                            .append(pass.to_doc(alloc, interner).indent(4))
+                            .append(pass.to_doc(alloc, interner, pretty).indent(4))
                             .append(alloc.hardline())
                             .append(alloc.text("else"))
-                            .append(default_branch.0.to_doc(alloc))
+                            .append(default_branch.0.to_doc(alloc, pretty))
                             .append(alloc.hardline())
-                            .append(fail.to_doc(alloc, interner).indent(4))
+                            .append(fail.to_doc(alloc, interner, pretty).indent(4))
                     }
 
                     _ => {
                         let default_doc = alloc
                             .text("default:")
                             .append(alloc.hardline())
-                            .append(default_branch.1.to_doc(alloc, interner).indent(4))
+                            .append(default_branch.1.to_doc(alloc, interner, pretty).indent(4))
                             .indent(4);
 
                         let branches_docs = branches
@@ -2289,14 +2293,14 @@ impl<'a> Stmt<'a> {
                                 alloc
                                     .text(format!("case {}:", tag))
                                     .append(alloc.hardline())
-                                    .append(expr.to_doc(alloc, interner).indent(4))
+                                    .append(expr.to_doc(alloc, interner, pretty).indent(4))
                                     .indent(4)
                             })
                             .chain(std::iter::once(default_doc));
                         //
                         alloc
                             .text("switch ")
-                            .append(symbol_to_doc(alloc, *cond_symbol))
+                            .append(symbol_to_doc(alloc, *cond_symbol, pretty))
                             .append(":")
                             .append(alloc.hardline())
                             .append(alloc.intersperse(
@@ -2308,7 +2312,9 @@ impl<'a> Stmt<'a> {
                 }
             }
 
-            Crash(s, _src) => alloc.text("Crash ").append(symbol_to_doc(alloc, *s)),
+            Crash(s, _src) => alloc
+                .text("Crash ")
+                .append(symbol_to_doc(alloc, *s, pretty)),
 
             Join {
                 id,
@@ -2316,29 +2322,31 @@ impl<'a> Stmt<'a> {
                 body: continuation,
                 remainder,
             } => {
-                let it = parameters.iter().map(|p| symbol_to_doc(alloc, p.symbol));
+                let it = parameters
+                    .iter()
+                    .map(|p| symbol_to_doc(alloc, p.symbol, pretty));
 
                 alloc.intersperse(
                     vec![
                         alloc
                             .text("joinpoint ")
-                            .append(join_point_to_doc(alloc, *id))
+                            .append(join_point_to_doc(alloc, *id, pretty))
                             .append(" ".repeat(parameters.len().min(1)))
                             .append(alloc.intersperse(it, alloc.space()))
                             .append(":"),
-                        continuation.to_doc(alloc, interner).indent(4),
+                        continuation.to_doc(alloc, interner, pretty).indent(4),
                         alloc.text("in"),
-                        remainder.to_doc(alloc, interner),
+                        remainder.to_doc(alloc, interner, pretty),
                     ],
                     alloc.hardline(),
                 )
             }
             Jump(id, arguments) => {
-                let it = arguments.iter().map(|s| symbol_to_doc(alloc, *s));
+                let it = arguments.iter().map(|s| symbol_to_doc(alloc, *s, pretty));
 
                 alloc
                     .text("jump ")
-                    .append(join_point_to_doc(alloc, *id))
+                    .append(join_point_to_doc(alloc, *id, pretty))
                     .append(" ".repeat(arguments.len().min(1)))
                     .append(alloc.intersperse(it, alloc.space()))
                     .append(";")
@@ -2346,13 +2354,13 @@ impl<'a> Stmt<'a> {
         }
     }
 
-    pub fn to_pretty<I>(&self, interner: &I, width: usize) -> String
+    pub fn to_pretty<I>(&self, interner: &I, width: usize, pretty: bool) -> String
     where
         I: Interner<'a, Layout<'a>>,
     {
         let allocator = BoxAllocator;
         let mut w = std::vec::Vec::new();
-        self.to_doc::<_, (), _>(&allocator, interner)
+        self.to_doc::<_, (), _>(&allocator, interner, pretty)
             .1
             .render(width, &mut w)
             .unwrap();
@@ -6568,13 +6576,14 @@ pub fn from_can<'a>(
             let cond_symbol = env.unique_symbol();
 
             let mut lookups = Vec::with_capacity_in(lookups_in_cond.len(), env.arena);
-            let mut layouts = Vec::with_capacity_in(lookups_in_cond.len(), env.arena);
+            let mut lookup_variables = Vec::with_capacity_in(lookups_in_cond.len(), env.arena);
+            let mut specialized_variables = Vec::with_capacity_in(lookups_in_cond.len(), env.arena);
 
             for ExpectLookup {
                 symbol,
                 var,
                 ability_info,
-            } in lookups_in_cond
+            } in lookups_in_cond.iter().copied()
             {
                 let symbol = match ability_info {
                     Some(specialization_id) => late_resolve_ability_specialization(
@@ -6585,20 +6594,28 @@ pub fn from_can<'a>(
                     ),
                     None => symbol,
                 };
-                let res_layout = layout_cache.from_var(env.arena, var, env.subs);
-                let layout = return_on_layout_error!(env, res_layout, "Expect");
-                if !matches!(layout, Layout::LambdaSet(..)) {
+
+                let expectation_subs = env
+                    .expectation_subs
+                    .as_deref_mut()
+                    .expect("if expects are compiled, their subs should be available");
+                let spec_var = expectation_subs.fresh_unnamed_flex_var();
+
+                if !env.subs.is_function(var) {
                     // Exclude functions from lookups
                     lookups.push(symbol);
-                    layouts.push(layout);
+                    lookup_variables.push(var);
+                    specialized_variables.push(spec_var);
                 }
             }
+
+            let specialized_variables = specialized_variables.into_bump_slice();
 
             let mut stmt = Stmt::Expect {
                 condition: cond_symbol,
                 region: loc_condition.region,
                 lookups: lookups.into_bump_slice(),
-                layouts: layouts.into_bump_slice(),
+                variables: specialized_variables,
                 remainder: env.arena.alloc(rest),
             };
 
@@ -6611,6 +6628,10 @@ pub fn from_can<'a>(
                 cond_symbol,
                 env.arena.alloc(stmt),
             );
+
+            // Now that the condition has been specialized, export the specialized types of our
+            // lookups into the expectation subs.
+            store_specialized_expectation_lookups(env, lookup_variables, specialized_variables);
 
             stmt
         }
@@ -6624,13 +6645,14 @@ pub fn from_can<'a>(
             let cond_symbol = env.unique_symbol();
 
             let mut lookups = Vec::with_capacity_in(lookups_in_cond.len(), env.arena);
-            let mut layouts = Vec::with_capacity_in(lookups_in_cond.len(), env.arena);
+            let mut lookup_variables = Vec::with_capacity_in(lookups_in_cond.len(), env.arena);
+            let mut specialized_variables = Vec::with_capacity_in(lookups_in_cond.len(), env.arena);
 
             for ExpectLookup {
                 symbol,
                 var,
                 ability_info,
-            } in lookups_in_cond
+            } in lookups_in_cond.iter().copied()
             {
                 let symbol = match ability_info {
                     Some(specialization_id) => late_resolve_ability_specialization(
@@ -6641,20 +6663,28 @@ pub fn from_can<'a>(
                     ),
                     None => symbol,
                 };
-                let res_layout = layout_cache.from_var(env.arena, var, env.subs);
-                let layout = return_on_layout_error!(env, res_layout, "Expect");
-                if !matches!(layout, Layout::LambdaSet(..)) {
+
+                let expectation_subs = env
+                    .expectation_subs
+                    .as_deref_mut()
+                    .expect("if expects are compiled, their subs should be available");
+                let spec_var = expectation_subs.fresh_unnamed_flex_var();
+
+                if !env.subs.is_function(var) {
                     // Exclude functions from lookups
                     lookups.push(symbol);
-                    layouts.push(layout);
+                    lookup_variables.push(var);
+                    specialized_variables.push(spec_var);
                 }
             }
+
+            let specialized_variables = specialized_variables.into_bump_slice();
 
             let mut stmt = Stmt::ExpectFx {
                 condition: cond_symbol,
                 region: loc_condition.region,
                 lookups: lookups.into_bump_slice(),
-                layouts: layouts.into_bump_slice(),
+                variables: specialized_variables,
                 remainder: env.arena.alloc(rest),
             };
 
@@ -6668,6 +6698,8 @@ pub fn from_can<'a>(
                 env.arena.alloc(stmt),
             );
 
+            store_specialized_expectation_lookups(env, lookup_variables, specialized_variables);
+
             stmt
         }
 
@@ -6679,12 +6711,23 @@ pub fn from_can<'a>(
         } => {
             let rest = from_can(env, variable, loc_continuation.value, procs, layout_cache);
 
+            let spec_var = env
+                .expectation_subs
+                .as_mut()
+                .unwrap()
+                .fresh_unnamed_flex_var();
+            // HACK(dbg-spec-var): pass the specialized type variable along injected into a fake symbol
+            let dbg_spec_var_symbol = Symbol::new(ModuleId::ATTR, unsafe {
+                IdentId::from_index(spec_var.index())
+            });
+
+            // TODO: need to store the specialized variable of this dbg in the expectation_subs
             let call = crate::ir::Call {
                 call_type: CallType::LowLevel {
                     op: LowLevel::Dbg,
                     update_mode: env.next_update_mode_id(),
                 },
-                arguments: env.arena.alloc([dbg_symbol]),
+                arguments: env.arena.alloc([dbg_symbol, dbg_spec_var_symbol]),
             };
 
             let dbg_layout = layout_cache
@@ -6711,6 +6754,10 @@ pub fn from_can<'a>(
                     env.arena.alloc(stmt),
                 );
             }
+
+            // Now that the dbg value has been specialized, export its specialized type into the
+            // expectations subs.
+            store_specialized_expectation_lookups(env, [variable], &[spec_var]);
 
             stmt
         }
@@ -6747,6 +6794,21 @@ pub fn from_can<'a>(
             let hole = env.arena.alloc(Stmt::Ret(symbol));
             with_hole(env, can_expr, variable, procs, layout_cache, symbol, hole)
         }
+    }
+}
+
+fn store_specialized_expectation_lookups(
+    env: &mut Env,
+    lookup_variables: impl IntoIterator<Item = Variable>,
+    specialized_variables: &[Variable],
+) {
+    let subs = &env.subs;
+    let expectation_subs = env.expectation_subs.as_deref_mut().unwrap();
+    for (lookup_var, stored_var) in lookup_variables.into_iter().zip(specialized_variables) {
+        let stored_specialized_var =
+            storage_copy_var_to(&mut Default::default(), subs, expectation_subs, lookup_var);
+        let stored_specialized_desc = expectation_subs.get(stored_specialized_var);
+        expectation_subs.union(*stored_var, stored_specialized_var, stored_specialized_desc);
     }
 }
 
@@ -7080,7 +7142,7 @@ fn substitute_in_stmt_help<'a>(
             condition,
             region,
             lookups,
-            layouts,
+            variables,
             remainder,
         } => {
             let new_remainder =
@@ -7095,7 +7157,7 @@ fn substitute_in_stmt_help<'a>(
                 condition: substitute(subs, *condition).unwrap_or(*condition),
                 region: *region,
                 lookups: new_lookups.into_bump_slice(),
-                layouts,
+                variables,
                 remainder: new_remainder,
             };
 
@@ -7106,7 +7168,7 @@ fn substitute_in_stmt_help<'a>(
             condition,
             region,
             lookups,
-            layouts,
+            variables,
             remainder,
         } => {
             let new_remainder =
@@ -7121,7 +7183,7 @@ fn substitute_in_stmt_help<'a>(
                 condition: substitute(subs, *condition).unwrap_or(*condition),
                 region: *region,
                 lookups: new_lookups.into_bump_slice(),
-                layouts,
+                variables,
                 remainder: new_remainder,
             };
 
@@ -8232,49 +8294,71 @@ fn specialize_symbol<'a>(
                         Err(e) => return_on_layout_error_help!(env, e, "specialize_symbol"),
                     };
 
-                    if procs.is_imported_module_thunk(original) {
-                        let layout = match raw {
-                            RawFunctionLayout::ZeroArgumentThunk(layout) => layout,
-                            RawFunctionLayout::Function(_, lambda_set, _) => {
-                                Layout::LambdaSet(lambda_set)
-                            }
-                        };
+                    match raw {
+                        RawFunctionLayout::Function(_, lambda_set, _)
+                            if !procs.is_imported_module_thunk(original) =>
+                        {
+                            let lambda_name =
+                                find_lambda_name(env, layout_cache, lambda_set, original, &[]);
 
-                        let raw = RawFunctionLayout::ZeroArgumentThunk(layout);
-                        let top_level = ProcLayout::from_raw(
-                            env.arena,
-                            &layout_cache.interner,
-                            raw,
-                            CapturesNiche::no_niche(),
-                        );
+                            debug_assert!(
+                                lambda_name.no_captures(),
+                                "imported functions are top-level and should never capture"
+                            );
 
-                        procs.insert_passed_by_name(
-                            env,
-                            arg_var,
-                            LambdaName::no_niche(original),
-                            top_level,
-                            layout_cache,
-                        );
+                            let function_ptr_layout = ProcLayout::from_raw(
+                                env.arena,
+                                &layout_cache.interner,
+                                raw,
+                                lambda_name.captures_niche(),
+                            );
+                            procs.insert_passed_by_name(
+                                env,
+                                arg_var,
+                                lambda_name,
+                                function_ptr_layout,
+                                layout_cache,
+                            );
 
-                        force_thunk(env, original, layout, assign_to, env.arena.alloc(result))
-                    } else {
-                        // Imported symbol, so it must have no captures niche (since
-                        // top-levels can't capture)
-                        let top_level = ProcLayout::from_raw(
-                            env.arena,
-                            &layout_cache.interner,
-                            raw,
-                            CapturesNiche::no_niche(),
-                        );
-                        procs.insert_passed_by_name(
-                            env,
-                            arg_var,
-                            LambdaName::no_niche(original),
-                            top_level,
-                            layout_cache,
-                        );
+                            construct_closure_data(
+                                env,
+                                procs,
+                                layout_cache,
+                                lambda_set,
+                                lambda_name,
+                                &[],
+                                assign_to,
+                                env.arena.alloc(result),
+                            )
+                        }
+                        _ => {
+                            // This is an imported ZAT that returns either a value, or the closure
+                            // data for a lambda set.
+                            let layout = match raw {
+                                RawFunctionLayout::ZeroArgumentThunk(layout) => layout,
+                                RawFunctionLayout::Function(_, lambda_set, _) => {
+                                    Layout::LambdaSet(lambda_set)
+                                }
+                            };
 
-                        let_empty_struct(assign_to, env.arena.alloc(result))
+                            let raw = RawFunctionLayout::ZeroArgumentThunk(layout);
+                            let top_level = ProcLayout::from_raw(
+                                env.arena,
+                                &layout_cache.interner,
+                                raw,
+                                CapturesNiche::no_niche(),
+                            );
+
+                            procs.insert_passed_by_name(
+                                env,
+                                arg_var,
+                                LambdaName::no_niche(original),
+                                top_level,
+                                layout_cache,
+                            );
+
+                            force_thunk(env, original, layout, assign_to, env.arena.alloc(result))
+                        }
                     }
                 }
 

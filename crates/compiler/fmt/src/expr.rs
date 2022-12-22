@@ -298,17 +298,7 @@ impl<'a> Formattable for Expr<'a> {
             }
             SingleQuote(string) => {
                 buf.indent(indent);
-                buf.push('\'');
-                for c in string.chars() {
-                    if c == '"' {
-                        buf.push_char_literal('"')
-                    } else {
-                        for escaped in c.escape_default() {
-                            buf.push_char_literal(escaped);
-                        }
-                    }
-                }
-                buf.push('\'');
+                format_sq_literal(buf, string);
             }
             &NonBase10Int {
                 base,
@@ -438,6 +428,20 @@ impl<'a> Formattable for Expr<'a> {
     }
 }
 
+pub(crate) fn format_sq_literal(buf: &mut Buf, s: &str) {
+    buf.push('\'');
+    for c in s.chars() {
+        if c == '"' {
+            buf.push_char_literal('"')
+        } else {
+            for escaped in c.escape_default() {
+                buf.push_char_literal(escaped);
+            }
+        }
+    }
+    buf.push('\'');
+}
+
 fn starts_with_newline(expr: &Expr) -> bool {
     use roc_parse::ast::Expr::*;
 
@@ -552,8 +556,13 @@ pub fn fmt_str_literal<'buf>(buf: &mut Buf<'buf>, literal: StrLiteral, indent: u
 
             for segments in lines.iter() {
                 for seg in segments.iter() {
-                    buf.indent(indent);
-                    format_str_segment(seg, buf, indent);
+                    // only add indent if the line isn't empty
+                    if *seg != StrSegment::Plaintext("\n") {
+                        buf.indent(indent);
+                        format_str_segment(seg, buf, indent);
+                    } else {
+                        buf.newline();
+                    }
                 }
 
                 buf.newline();

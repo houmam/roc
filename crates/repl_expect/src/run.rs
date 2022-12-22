@@ -1,4 +1,10 @@
-use std::{os::unix::process::parent_id, sync::Arc};
+use std::{
+    os::unix::process::parent_id,
+    sync::{
+        atomic::{AtomicBool, AtomicU32},
+        Arc,
+    },
+};
 
 use bumpalo::collections::Vec as BumpVec;
 use bumpalo::Bump;
@@ -13,13 +19,13 @@ use roc_gen_llvm::{
     run_roc_dylib,
 };
 use roc_intern::{GlobalInterner, SingleThreadedInterner};
-use roc_load::{EntryPoint, Expectations, MonomorphizedModule};
+use roc_load::{Expectations, MonomorphizedModule};
 use roc_module::symbol::{Interns, ModuleId, Symbol};
 use roc_mono::{ir::OptLevel, layout::Layout};
 use roc_region::all::Region;
 use roc_reporting::{error::expect::Renderer, report::RenderTarget};
 use roc_target::TargetInfo;
-use roc_types::subs::{Subs, Variable};
+use roc_types::subs::Subs;
 use target_lexicon::Triple;
 
 pub struct ExpectMemory<'a> {
@@ -104,6 +110,16 @@ impl<'a> ExpectMemory<'a> {
         let set_shared_buffer = run_roc_dylib!(lib, "set_shared_buffer", (*mut u8, usize), ());
         let mut result = RocCallResult::default();
         unsafe { set_shared_buffer((self.ptr, self.length), &mut result) };
+    }
+
+    pub fn wait_for_child(&self, sigchld: Arc<AtomicBool>) -> ChildProcessMsg {
+        let sequence = ExpectSequence { ptr: self.ptr };
+        sequence.wait_for_child(sigchld)
+    }
+
+    pub fn reset(&mut self) {
+        let mut sequence = ExpectSequence { ptr: self.ptr };
+        sequence.reset();
     }
 }
 
@@ -455,7 +471,7 @@ pub fn render_dbgs_in_memory<'a>(
     )
 }
 
-fn split_expect_lookups(subs: &Subs, lookups: &[ExpectLookup]) -> (Vec<Symbol>, Vec<Variable>) {
+fn split_expect_lookups(subs: &Subs, lookups: &[ExpectLookup]) -> Vec<Symbol> {
     lookups
         .iter()
         .filter_map(
@@ -469,11 +485,11 @@ fn split_expect_lookups(subs: &Subs, lookups: &[ExpectLookup]) -> (Vec<Symbol>, 
                 if subs.is_function(*var) {
                     None
                 } else {
-                    Some((*symbol, *var))
+                    Some(*symbol)
                 }
             },
         )
-        .unzip()
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -507,15 +523,7 @@ fn render_dbg_failure<'a>(
 
     let subs = arena.alloc(&mut data.subs);
 
-    let current = ExpectLookup {
-        symbol: current.symbol,
-        var: current.var,
-        ability_info: current.ability_info,
-    };
-
-    let (_symbols, variables) = split_expect_lookups(subs, &[current]);
-
-    let (offset, expressions) = crate::get_values(
+    let (offset, expressions, _variables) = crate::get_values(
         target_info,
         arena,
         subs,
@@ -523,7 +531,7 @@ fn render_dbg_failure<'a>(
         layout_interner,
         start,
         frame.start_offset,
-        &variables,
+        1,
     );
 
     renderer.render_dbg(writer, &expressions, expect_region, failure_region)?;
@@ -558,24 +566,23 @@ fn render_expect_failure<'a>(
         None => panic!("region {failure_region:?} not in list of expects"),
         Some(current) => current,
     };
-    let subs = arena.alloc(&mut data.subs);
 
-    let (symbols, variables) = split_expect_lookups(subs, current);
+    let symbols = split_expect_lookups(&data.subs, current);
 
-    let (offset, expressions) = crate::get_values(
+    let (offset, expressions, variables) = crate::get_values(
         target_info,
         arena,
-        subs,
+        &data.subs,
         interns,
         layout_interner,
         start,
         frame.start_offset,
-        &variables,
+        symbols.len(),
     );
 
     renderer.render_failure(
         writer,
-        subs,
+        &mut data.subs,
         &symbols,
         &variables,
         &expressions,
@@ -591,16 +598,18 @@ struct ExpectSequence {
 }
 
 impl ExpectSequence {
-    const START_OFFSET: usize = 16;
+    const START_OFFSET: usize = 8 + 8 + 8;
 
     const COUNT_INDEX: usize = 0;
     const OFFSET_INDEX: usize = 1;
+    const LOCK_INDEX: usize = 2;
 
     fn new(ptr: *mut u8) -> Self {
         unsafe {
             let ptr = ptr as *mut usize;
             std::ptr::write_unaligned(ptr.add(Self::COUNT_INDEX), 0);
             std::ptr::write_unaligned(ptr.add(Self::OFFSET_INDEX), Self::START_OFFSET);
+            std::ptr::write_unaligned(ptr.add(Self::LOCK_INDEX), 0);
         }
 
         Self {
@@ -611,11 +620,47 @@ impl ExpectSequence {
     fn count_failures(&self) -> usize {
         unsafe { *(self.ptr as *const usize).add(Self::COUNT_INDEX) }
     }
+
+    fn wait_for_child(&self, sigchld: Arc<AtomicBool>) -> ChildProcessMsg {
+        use std::sync::atomic::Ordering;
+        let ptr = self.ptr as *const u32;
+        let atomic_ptr: *const AtomicU32 = unsafe { ptr.add(5).cast() };
+        let atomic = unsafe { &*atomic_ptr };
+
+        loop {
+            if sigchld.load(Ordering::Relaxed) {
+                break ChildProcessMsg::Terminate;
+            }
+
+            match atomic.load(Ordering::Acquire) {
+                0 => std::hint::spin_loop(),
+                1 => break ChildProcessMsg::Expect,
+                2 => break ChildProcessMsg::Dbg,
+                n => panic!("invalid atomic value set by the child: {:#x}", n),
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        unsafe {
+            let ptr = self.ptr as *mut usize;
+            std::ptr::write_unaligned(ptr.add(Self::COUNT_INDEX), 0);
+            std::ptr::write_unaligned(ptr.add(Self::OFFSET_INDEX), Self::START_OFFSET);
+            std::ptr::write_unaligned(ptr.add(Self::LOCK_INDEX), 0);
+        }
+    }
+}
+
+pub enum ChildProcessMsg {
+    Expect = 1,
+    Dbg = 2,
+    Terminate = 3,
 }
 
 struct ExpectFrame {
     region: Region,
     module_id: ModuleId,
+
     start_offset: usize,
 }
 
@@ -627,8 +672,8 @@ impl ExpectFrame {
         let module_id_bytes: [u8; 4] = unsafe { *(start.add(offset + 8).cast()) };
         let module_id: ModuleId = unsafe { std::mem::transmute(module_id_bytes) };
 
-        // skip to frame, 8 bytes for region, 4 for module id
-        let start_offset = offset + 12;
+        // skip to frame
+        let start_offset = offset + 8 + 4;
 
         Self {
             region,
@@ -670,7 +715,6 @@ pub fn expect_mono_module_to_dylib<'a>(
     let MonomorphizedModule {
         toplevel_expects,
         procedures,
-        entry_point,
         interns,
         layout_interner,
         ..
@@ -708,13 +752,6 @@ pub fn expect_mono_module_to_dylib<'a>(
     // platform to provide them.
     add_default_roc_externs(&env);
 
-    let opt_entry_point = match entry_point {
-        EntryPoint::Executable { symbol, layout, .. } => {
-            Some(roc_mono::ir::EntryPoint { symbol, layout })
-        }
-        EntryPoint::Test => None,
-    };
-
     let capacity = toplevel_expects.pure.len() + toplevel_expects.fx.len();
     let mut expect_symbols = BumpVec::with_capacity_in(capacity, env.arena);
 
@@ -726,7 +763,6 @@ pub fn expect_mono_module_to_dylib<'a>(
         opt_level,
         &expect_symbols,
         procedures,
-        opt_entry_point,
     );
 
     let expects_fx = bumpalo::collections::Vec::from_iter_in(

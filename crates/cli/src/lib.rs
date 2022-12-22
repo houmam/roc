@@ -853,7 +853,7 @@ fn roc_run<'a, I: IntoIterator<Item = &'a OsStr>>(
             {
                 use std::os::unix::ffi::OsStrExt;
 
-                run_with_wasmer(
+                run_wasm(
                     generated_filename,
                     args.into_iter().map(|os_str| os_str.as_bytes()),
                 );
@@ -861,11 +861,11 @@ fn roc_run<'a, I: IntoIterator<Item = &'a OsStr>>(
 
             #[cfg(not(target_family = "unix"))]
             {
-                run_with_wasmer(
+                run_wasm(
                     generated_filename,
                     args.into_iter().map(|os_str| {
                         os_str.to_str().expect(
-                            "Roc does not currently support passing non-UTF8 arguments to Wasmer.",
+                            "Roc does not currently support passing non-UTF8 arguments to Wasm.",
                         )
                     }),
                 );
@@ -1042,12 +1042,9 @@ fn roc_dev_native(
     envp: bumpalo::collections::Vec<*const c_char>,
     expect_metadata: ExpectMetadata,
 ) -> ! {
-    use roc_repl_expect::run::ExpectMemory;
-    use signal_hook::{
-        consts::signal::SIGCHLD,
-        consts::signal::{SIGUSR1, SIGUSR2},
-        iterator::Signals,
-    };
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    use roc_repl_expect::run::{ChildProcessMsg, ExpectMemory};
 
     let ExpectMetadata {
         mut expectations,
@@ -1055,11 +1052,9 @@ fn roc_dev_native(
         layout_interner,
     } = expect_metadata;
 
-    let mut signals = Signals::new(&[SIGCHLD, SIGUSR1, SIGUSR2]).unwrap();
-
     // let shm_name =
     let shm_name = format!("/roc_expect_buffer_{}", std::process::id());
-    let memory = ExpectMemory::create_or_reuse_mmap(&shm_name);
+    let mut memory = ExpectMemory::create_or_reuse_mmap(&shm_name);
 
     let layout_interner = layout_interner.into_global();
 
@@ -1085,12 +1080,14 @@ fn roc_dev_native(
             std::process::exit(1)
         }
         1.. => {
-            for sig in &mut signals {
-                match sig {
-                    SIGCHLD => break,
-                    SIGUSR1 => {
-                        // this is the signal we use for an expect failure. Let's see what the child told us
+            let sigchld = Arc::new(AtomicBool::new(false));
+            signal_hook::flag::register(signal_hook::consts::SIGCHLD, Arc::clone(&sigchld))
+                .unwrap();
 
+            loop {
+                match memory.wait_for_child(sigchld.clone()) {
+                    ChildProcessMsg::Terminate => break,
+                    ChildProcessMsg::Expect => {
                         roc_repl_expect::run::render_expects_in_memory(
                             &mut writer,
                             arena,
@@ -1100,10 +1097,10 @@ fn roc_dev_native(
                             &memory,
                         )
                         .unwrap();
-                    }
-                    SIGUSR2 => {
-                        // this is the signal we use for a dbg
 
+                        memory.reset();
+                    }
+                    ChildProcessMsg::Dbg => {
                         roc_repl_expect::run::render_dbgs_in_memory(
                             &mut writer,
                             arena,
@@ -1113,8 +1110,9 @@ fn roc_dev_native(
                             &memory,
                         )
                         .unwrap();
+
+                        memory.reset();
                     }
-                    _ => println!("received signal {}", sig),
                 }
             }
 
@@ -1241,38 +1239,33 @@ fn roc_run_native<I: IntoIterator<Item = S>, S: AsRef<OsStr>>(
 }
 
 #[cfg(feature = "run-wasm32")]
-fn run_with_wasmer<I: Iterator<Item = S>, S: AsRef<[u8]>>(wasm_path: &std::path::Path, args: I) {
-    use wasmer::{Instance, Module, Store};
+fn run_wasm<I: Iterator<Item = S>, S: AsRef<[u8]>>(wasm_path: &std::path::Path, args: I) {
+    use bumpalo::collections::Vec;
+    use roc_wasm_interp::{DefaultImportDispatcher, Instance};
 
-    let store = Store::default();
-    let module = Module::from_file(&store, &wasm_path).unwrap();
+    let bytes = std::fs::read(wasm_path).unwrap();
+    let arena = Bump::new();
 
-    // First, we create the `WasiEnv`
-    use wasmer_wasi::WasiState;
-    let mut wasi_env = WasiState::new("hello").args(args).finalize().unwrap();
-
-    // Then, we get the import object related to our WASI
-    // and attach it to the Wasm instance.
-    let import_object = wasi_env.import_object(&module).unwrap();
-
-    let instance = Instance::new(&module, &import_object).unwrap();
-
-    let start = instance.exports.get_function("_start").unwrap();
-
-    use wasmer_wasi::WasiError;
-    match start.call(&[]) {
-        Ok(_) => {}
-        Err(e) => match e.downcast::<WasiError>() {
-            Ok(WasiError::Exit(0)) => {
-                // we run the `_start` function, so exit(0) is expected
-            }
-            other => panic!("Wasmer error: {:?}", other),
-        },
+    let mut argv = Vec::<&[u8]>::new_in(&arena);
+    for arg in args {
+        let mut arg_copy = Vec::<u8>::new_in(&arena);
+        arg_copy.extend_from_slice(arg.as_ref());
+        argv.push(arg_copy.into_bump_slice());
     }
+    let import_dispatcher = DefaultImportDispatcher::new(&argv);
+
+    let mut instance = Instance::from_bytes(&arena, &bytes, import_dispatcher, false).unwrap();
+
+    instance
+        .call_export("_start", [])
+        .unwrap()
+        .unwrap()
+        .expect_i32()
+        .unwrap();
 }
 
 #[cfg(not(feature = "run-wasm32"))]
-fn run_with_wasmer<I: Iterator<Item = S>, S: AsRef<[u8]>>(_wasm_path: &std::path::Path, _args: I) {
+fn run_wasm<I: Iterator<Item = S>, S: AsRef<[u8]>>(_wasm_path: &std::path::Path, _args: I) {
     println!("Running wasm files is not supported on this target.");
 }
 
