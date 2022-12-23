@@ -1759,6 +1759,27 @@ impl<'a> NameSection<'a> {
 
         NameSection { function_names }
     }
+
+    pub fn lookup_name(&self, target_fn_index: u32) -> Option<&'a str> {
+        // The name section is required to have function indices in order. Let's use that.
+        // Often, every function has a name, so we don't need to search. Try that first.
+        let search_down_from = if let Some((idx, name)) = self.function_names.get(target_fn_index as usize) {
+            if *idx == target_fn_index {
+                return Some(*name);
+            }
+            target_fn_index as usize 
+        } else {
+            self.function_names.len()
+        };
+        // If we get here, some functions have no debug name. Target must be *lower*.
+        for name_index in (0..search_down_from).rev() {
+            let (idx, name) = self.function_names[name_index];
+            if idx == target_fn_index {
+                return Some(name)
+            }
+        }
+        None
+    }
 }
 
 impl<'a> Parse<&'a Bump> for NameSection<'a> {

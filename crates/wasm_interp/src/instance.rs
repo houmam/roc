@@ -1798,7 +1798,8 @@ impl<'a, I: ImportDispatcher> Instance<'a, I> {
             };
 
             // Function and address match wasm-objdump formatting, for easy copy & find
-            writeln!(buffer, "func[{}]", fn_index)?;
+            let name = self.module.names.lookup_name(*fn_index as u32).unwrap_or_default();
+            writeln!(buffer, "func[{}] {}", fn_index, name)?;
             writeln!(buffer, "  address  {:06x}", execution_addrs.next().unwrap())?;
 
             write!(buffer, "  args     ")?;
