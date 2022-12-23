@@ -382,12 +382,12 @@ impl<'a> WasmBackend<'a> {
 
     ***********************************************************/
 
-    pub fn build_proc(&mut self, proc: &Proc<'a>) {
+    pub fn build_proc(&mut self, proc_index: usize, proc: &Proc<'a>) {
         if DEBUG_SETTINGS.proc_start_end {
             println!("\ngenerating procedure {:?}\n", proc.name);
         }
 
-        self.append_proc_debug_name(proc.name.name());
+        self.append_proc_debug_name(proc_index, proc.name.name());
 
         self.start_proc(proc);
 
@@ -462,12 +462,7 @@ impl<'a> WasmBackend<'a> {
         }
     }
 
-    fn append_proc_debug_name(&mut self, sym: Symbol) {
-        let proc_index = self
-            .proc_lookup
-            .iter()
-            .position(|ProcLookupData { name, .. }| *name == sym)
-            .unwrap();
+    fn append_proc_debug_name(&mut self, proc_index: usize, sym: Symbol) {
         let wasm_fn_index = self.fn_index_offset + proc_index as u32;
 
         let name = String::from_str_in(sym.as_str(self.interns), self.env.arena).into_bump_str();
@@ -595,7 +590,7 @@ impl<'a> WasmBackend<'a> {
             ret_type: None,
         });
 
-        self.append_proc_debug_name(wrapper_name);
+        self.append_proc_debug_name(wrapper_lookup_idx, wrapper_name);
         self.reset();
     }
 
@@ -648,7 +643,7 @@ impl<'a> WasmBackend<'a> {
             ret_type: Some(ValueType::I32),
         });
 
-        self.append_proc_debug_name(wrapper_name);
+        self.append_proc_debug_name(wrapper_lookup_idx, wrapper_name);
         self.reset();
     }
 

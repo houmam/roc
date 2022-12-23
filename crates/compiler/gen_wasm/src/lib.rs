@@ -149,8 +149,8 @@ pub fn build_app_module<'a>(
     }
 
     // Generate procs from user code
-    for proc in procs.iter() {
-        backend.build_proc(proc);
+    for (i, proc) in procs.iter().enumerate() {
+        backend.build_proc(i, proc);
     }
 
     // Generate specialized helpers for refcounting & equality
@@ -179,7 +179,7 @@ pub fn build_app_module<'a>(
         use ProcSource::*;
         match source {
             Roc => { /* already generated */ }
-            Helper => backend.build_proc(helper_iter.next().unwrap()),
+            Helper => backend.build_proc(idx, helper_iter.next().unwrap()),
             HigherOrderMapper(inner_idx) => backend.build_higher_order_mapper(idx, *inner_idx),
             HigherOrderCompare(inner_idx) => backend.build_higher_order_compare(idx, *inner_idx),
         }
