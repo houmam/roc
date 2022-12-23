@@ -1763,6 +1763,8 @@ impl<'a, I: ImportDispatcher> Instance<'a, I> {
         let frames = self.previous_frames.iter().chain(once(&self.current_frame));
         let next_frames = frames.clone().skip(1);
 
+        let offset = self.module.code.section_offset as usize;
+
         // Find the code address to display for each frame
         // For previous frames, show the address of the CALL instruction
         // For the current frame, show the program counter value
@@ -1770,9 +1772,9 @@ impl<'a, I: ImportDispatcher> Instance<'a, I> {
             // for each previous_frame, find return address of the *next* frame
             let return_addrs = next_frames.clone().map(|f| f.return_addr);
             // roll back to the CALL instruction before that return address, it's more meaningful.
-            let call_addrs = return_addrs.map(|ra| self.debug_return_addr_to_call_addr(ra));
+            let call_addrs = return_addrs.map(|ra| self.debug_return_addr_to_call_addr(ra) + offset);
             // For the current frame, show the program_counter
-            call_addrs.chain(once(self.program_counter))
+            call_addrs.chain(once(self.program_counter + offset))
         };
 
         let mut frame_ends = next_frames.map(|f| f.locals_start);
